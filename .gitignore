@@ -1,0 +1,7 @@
+*.apk
+*.idsig
+*.keystore
+__pycache__/
+session.json
+header-template.local.json
+.DS_Store
