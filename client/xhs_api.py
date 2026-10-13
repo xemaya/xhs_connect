@@ -19,8 +19,10 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -49,8 +51,8 @@ TARGETS = {
     'real': {
         'serial': '101114e',               # 小米 kunzite，Android 15
         'pkg': 'com.xingin.xhsre',         # 重打包包名（与官方包共存）
-        'frida_host': os.environ.get('XHS_GADGET_HOST', '127.0.0.1:27043'),
-        'gadget': True,                    # 进程内 gadget，不能 spawn，只能启动后 attach
+        'gadget': True,                    # gadget script-interaction 形态
+        'tcp_port': int(os.environ.get('XHS_RE_PORT', '27045')),  # adb reverse 反向通道端口
     },
 }
 TARGET = os.environ.get('XHS_TARGET', 'emu')
@@ -60,11 +62,96 @@ def log(msg):
     print(f'[xhs] {msg}', file=sys.stderr)
 
 
+class TcpRpc:
+    """真机形态的反向 RPC 通道：Mac 做服务端，App 内嵌脚本主动连入（adb reverse）。
+
+    选反向的原因（实测）：gadget script 模式下 gum 的 Socket.listen 能 bind，
+    但 accept 的 promise 不派发；Socket.connect 出站正常。无 frida attach、
+    无桥协议、无注入竞态。"""
+
+    def __init__(self, serial, port):
+        self.serial = serial
+        self.port = port
+        self.srv = None
+        self.sock = None
+        self.buf = b''
+        self.lock = threading.Lock()
+        self.next_id = 1
+
+    def _ensure_server(self):
+        if self.srv is not None:
+            return
+        subprocess.run([ADB, '-s', self.serial, 'reverse',
+                        f'tcp:{self.port}', f'tcp:{self.port}'],
+                       capture_output=True, timeout=15)
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(('127.0.0.1', self.port))
+        self.srv.listen(4)
+
+    def wait_conn(self, timeout=90):
+        """等内嵌脚本连入；顶掉旧连接。"""
+        self._ensure_server()
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        self.srv.settimeout(timeout)
+        self.sock, _ = self.srv.accept()
+        self.sock.settimeout(120)
+        self.buf = b''
+        log('内嵌脚本已连入')
+
+    def call(self, method, *params):
+        with self.lock:
+            if self.sock is None:
+                self.wait_conn()
+            rid = self.next_id
+            self.next_id += 1
+            req = json.dumps({'id': rid, 'method': method,
+                              'params': list(params)}, ensure_ascii=False)
+            try:
+                self.sock.sendall(req.encode('utf-8') + b'\n')
+                while True:
+                    while b'\n' not in self.buf:
+                        chunk = self.sock.recv(65536)
+                        if not chunk:
+                            raise ConnectionError('签名服务连接断开')
+                        self.buf += chunk
+                    line, self.buf = self.buf.split(b'\n', 1)
+                    if not line.strip():
+                        continue
+                    resp = json.loads(line)
+                    if resp.get('id') != rid:
+                        continue
+                    if resp.get('error'):
+                        raise RuntimeError(resp['error'])
+                    return resp.get('result')
+            except (ConnectionError, OSError, json.JSONDecodeError):
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+                raise
+
+    def ping(self):
+        try:
+            self.call('status')
+            return True
+        except Exception:
+            return False
+
+
+
 class XhsClient:
     def __init__(self, spawn=True, ready_timeout=120, target=None):
         self.cfg = TARGETS[target or TARGET]
         self.pkg = self.cfg['pkg']
-        self.device = self._get_device()
+        self.tcp = None
+        self.device = None if self.cfg['gadget'] else self._get_device()
         self.pid = None
         self.spawned = False
         self.script = None
@@ -72,13 +159,23 @@ class XhsClient:
         self.session_id = None
         self._load_session()
         self._load_header_fallback()
-        self._launch(spawn and not self.cfg['gadget'])
-        self._load_script()
-        if self.spawned:
-            self.device.resume(self.pid)
-            log('App 已 resume')
+        if self.cfg['gadget']:
+            self.tcp = TcpRpc(self.cfg['serial'], self.cfg['tcp_port'])
+            self._launch_gadget_tcp()
+        else:
+            self._launch(spawn)
+            self._load_script()
+            if self.spawned:
+                self.device.resume(self.pid)
+                log('App 已 resume')
         self._wait_ready(ready_timeout)
         self.http = requests.Session()
+
+    # ---------- RPC 统一入口 ----------
+    def _rpc(self, method, *params):
+        if self.tcp is not None:
+            return self.tcp.call(method, *params)
+        return getattr(self.script.exports_sync, method)(*params)
 
     # ---------- 目标相关的底层 ----------
     def _adb(self, *args):
@@ -112,56 +209,52 @@ class XhsClient:
         self.script.load()
 
     def _reattach(self):
-        """进程死后（看门狗/自重启），重新拉起并 attach，重载脚本等到就绪。"""
-        log('会话已断开，尝试重新 attach...')
-        for _ in range(30):
+        """进程死后（看门狗/自重启）重连。有上限+退避，绝不做拉起风暴。"""
+        log('会话已断开，尝试重新连接...')
+        for attempt in range(3):
+            if attempt:
+                wait = 5 * attempt
+                log(f'{wait}s 后第 {attempt + 1} 次重连...')
+                time.sleep(wait)
             try:
                 if self.cfg['gadget']:
-                    self._launch_gadget()
+                    self._launch_gadget_tcp()
                 else:
                     pid = self._xhs_pid()
                     if pid is None:
-                        time.sleep(1)
                         continue
                     self.pid = pid
                     self.session = self.device.attach(pid)
-                self._load_script()
-                log(f'重新 attach 成功 pid={self.pid}，等待就绪')
+                    self._load_script()
+                    log(f'重新 attach 成功 pid={self.pid}，等待就绪')
                 for _ in range(30):
-                    st = self.script.exports_sync.status() or {}
+                    st = self._rpc('status') or {}
                     if st.get('ready'):
-                        log('重 attach 后就绪')
+                        log('重连后就绪')
                         return True
                     time.sleep(1)
             except Exception as e:
-                log(f'attach 异常：{e}')
-                time.sleep(1)
+                log(f'重连异常：{e}')
+        log('重连次数用尽，放弃（可手动重跑命令）')
         return False
 
     # ---------- 启动 / attach ----------
-    def _launch_gadget(self):
-        """真机 gadget 形态：monkey 拉起 App，gadget 在 attachBaseContext 里
-        on_load=wait 等 frida 连接；连上 remote device 后 attach 到它报告的进程。"""
-        self._adb('shell', 'monkey', '-p', self.pkg, '-c',
-                  'android.intent.category.LAUNCHER', '1')
-        for _ in range(60):
-            try:
-                self.device = self._get_device()
-                procs = self.device.enumerate_processes()
-                if procs:
-                    self.pid = procs[0].pid
-                    self.session = self.device.attach(self.pid)
-                    log(f'gadget attach 成功 pid={self.pid}')
-                    return
-            except Exception:
-                pass
-            time.sleep(1)
-        raise RuntimeError('gadget 一直不可连接')
+    def _launch_gadget_tcp(self):
+        """真机形态：内嵌脚本随 App 启动自加载，主动反向连入本机的监听端口。
+        进程没在跑才 monkey 拉起；然后等脚本连入。"""
+        self.tcp._ensure_server()
+        if self.tcp.ping():
+            log('签名通道在线，直连')
+            return
+        if not self._xhs_pid():
+            self._adb('shell', 'monkey', '-p', self.pkg, '-c',
+                      'android.intent.category.LAUNCHER', '1')
+            log('已拉起 App，等待内嵌脚本反向连入')
+        else:
+            log('App 在跑但通道未建立，等它连入（或重启 App）')
+        self.tcp.wait_conn(timeout=90)
 
     def _launch(self, spawn):
-        if self.cfg['gadget']:
-            self._launch_gadget()
-            return
         if spawn:
             try:
                 # 防止上一个实例残留导致多进程并存
@@ -213,7 +306,7 @@ class XhsClient:
         last = None
         while time.time() < deadline:
             try:
-                st = self.script.exports_sync.status() or {'warming': True}
+                st = self._rpc('status') or {'warming': True}
             except Exception as e:
                 log(f'status 调用失败（{type(e).__name__}: {e}）')
                 if not self._reattach():
@@ -252,7 +345,7 @@ class XhsClient:
 
     def sign(self, method, url, body=b''):
         body_b64 = base64.b64encode(body).decode() if body else ''
-        res = self.script.exports_sync.sign(method, url, body_b64)
+        res = self._rpc('sign', method, url, body_b64)
         headers = res['headers']
         if not res.get('meta', {}).get('template'):
             have = {k.lower() for k in headers}
@@ -307,7 +400,7 @@ class XhsClient:
             if r.status_code == 406 and 'xy-ter-str' in r.headers and attempt < _retries:
                 log('收到 406 + xy-ter-str，轮换 shield 密钥后重试')
                 try:
-                    self.script.exports_sync.rotateshield(r.headers['xy-ter-str'])
+                    self._rpc('rotateshield', r.headers['xy-ter-str'])
                 except Exception as e:
                     log(f'轮换失败（{e}）')
                     if not self._reattach():
@@ -337,7 +430,7 @@ class XhsClient:
         pw_md5 = hashlib.md5(password.encode('utf-8')).hexdigest()
         form = {'password': pw_md5, 'zone': zone, 'phone': phone}
         try:
-            dev_params = self.script.exports_sync.loginparams()
+            dev_params = self._rpc('loginparams')
             log(f'登录设备参数 {len(dev_params)} 项：'
                 + ', '.join(f'{k}={str(v)[:12]}' for k, v in list(dev_params.items())[:6]))
             form.update({k: ('' if v is None else str(v)) for k, v in dev_params.items()})
@@ -430,7 +523,7 @@ def main():
     client = XhsClient(spawn=not args.no_spawn, target=args.target)
 
     if args.cmd == 'status':
-        print(json.dumps(client.script.exports_sync.status(),
+        print(json.dumps(client._rpc('status'),
                          ensure_ascii=False, indent=2))
         return
 

@@ -33,6 +33,19 @@
       console.log('[sign] 封堵 ' + name + ' 失败：' + e);
     }
   });
+  // 重打包签名校验失败时走的是 abort()（SIGABRT，匿名内存里的解密代码）。
+  // abort 不做清理，直接返回即可"失败开放"——调用方当作没事继续跑。
+  var abortAddr = Module.findGlobalExportByName('abort');
+  if (abortAddr && !seen[abortAddr.toString()]) {
+    try {
+      Interceptor.replace(abortAddr, new NativeCallback(function () {
+        console.log('[sign] 拦截到 abort()，吞掉（签名校验失败开放）');
+      }, 'void', []));
+      console.log('[sign] 已封堵 abort @ ' + abortAddr);
+    } catch (e) {
+      console.log('[sign] 封堵 abort 失败：' + e);
+    }
+  }
 })();
 
 /* ---------- Java 桥手动加载（frida 17 不再内建，复刻 frida-tools REPL 的做法） ---------- */
@@ -65,7 +78,7 @@
     if (pkg === 'com.xingin.xhs') return;  // 官方包不用 hook
     Java.perform(function () {
       Java.use('android.content.pm.Signature').hashCode.implementation = function () {
-        return ORIG_SIG_HASHCODE >>> 0;  // 桥按 uint32 转 int 位模式
+        return ORIG_SIG_HASHCODE;  // Java int 是有符号 32 位，直接给负值（>>>0 超界会被桥拒绝）
       };
       console.log('[sign] 重打包包（' + pkg + '），Signature.hashCode 已钩为 ' + ORIG_SIG_HASHCODE);
     });
