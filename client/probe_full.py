@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """真机全链路：login（设备内发）→ search → note，进程死掉就重启重试。"""
 import base64
+import os
 import hashlib
 import json
 import subprocess
@@ -55,8 +56,9 @@ def attempt(n):
     c = XhsClient(target='real', spawn=False, ready_timeout=45)
 
     # 1) 登录（设备内发，手机 IP 不过 300012）
-    pw_md5 = hashlib.md5('qq123456'.encode()).hexdigest()
-    form = {'password': pw_md5, 'zone': '1', 'phone': '2895874976'}
+    pw_md5 = hashlib.md5(os.environ['XHS_PASSWORD'].encode()).hexdigest()
+    form = {'password': pw_md5, 'zone': os.environ.get('XHS_ZONE', '1'),
+        'phone': os.environ['XHS_PHONE']}
     dev = c._rpc('loginparams')
     form.update({k: ('' if v is None else str(v)) for k, v in dev.items()})
     r = device_post(c, 'https://edith.xiaohongshu.com/api/sns/v4/user/login/password', form)
