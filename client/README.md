@@ -11,6 +11,29 @@
 | `emu`（默认） | Android 12 模拟器 emulator-5554 | com.xingin.xhs（官方 v9.36.2） | frida-server（改名 `.kworker` + 端口 44444） | `127.0.0.1:44444` |
 | `real` | 小米真机 101114e（Android 15，无 root） | com.xingin.xhsre（重打包 v9.36.2） | frida-gadget 17.23.3 打进 APK，主进程 `attachBaseContext` 加载，listen 127.0.0.1:27043，`on_load=wait` | `127.0.0.1:27043`（自动 `adb -s 101114e forward`） |
 
+## 真机最新用法（2026-10-13 晚更新）
+
+真机侧已换成 **gadget script-interaction + 反向 TCP**（内嵌脚本主动连 Mac 27045，
+`adb reverse tcp:27045 tcp:27045`），并新增三个 RPC：
+
+| RPC | 用途 |
+| --- | --- |
+| `fetch(method,url,bodyB64,contentType)` | 借 App 的 edith OkHttpClient 执行（全真拦截器链，鉴权最强；有概率触发看门狗杀进程，客户端会自动重连重试） |
+| `rawfetch(url, headersArr, bodyB64)` | 先 sign 算头再 HttpsURLConnection 从手机发出（稳定不死；guest 接口可用，登录态接口会被软拒"登录已过期"） |
+| `userstate()` / `evaljs(code)` | 读 App 账号态（isLogin/sessionId/userId/userToken）/ 任意 Java 探针 |
+
+**当前推荐用法**：手机上把「小红书RE」UI 登录一次（账号密码即可，真机住宅 IP 不过风控），
+之后 Mac 侧无需再碰手机：
+
+```bash
+python xhs_api.py --target real userstate        # 确认登录态
+python xhs_api.py --target real search "咖啡"     # ✅ 已验证：20 条真实结果含 xsec_token
+python xhs_api.py --target real note <note_id> --xsec-token <token>   # 待回归验证
+```
+
+已知边界与未解项见 `docs/真机迁移与现场情况.md` 第六节（登录 API 直连仍被 300015 环境风控挡、
+App 有周期性无痕自杀由客户端重连兜底等）。
+
 ## 真机重打包（`~/re-targets/xhs-repack/`）
 
 1. `apktool d -f xhs_base.apk -o decoded`（全量解包；`-r` 会连 AndroidManifest 也保持二进制，没法改包名）。

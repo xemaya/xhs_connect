@@ -93,6 +93,8 @@ var S = {
   sampleUrl: null,
   recentUrls: [],           // 最近见过的 edith URL（最多 20 条）
   recentResp: [],           // 最近 edith 响应 [url, code]（最多 30 条，排障用）
+  recentReqs: [],           // shield intercept 钩到的完整请求 {url,method,headers,body,code}（最多 12 条）
+  hookedInterceptCls: {},   // 已装 hook 的 XhsHttpInterceptor 类（按 ClassLoader 区分）
   fakeChainCls: null,       // Java.registerClass 的假 Interceptor.Chain
   lastErr: {},
   shieldWarn: null,
@@ -233,28 +235,79 @@ function addShieldInstance(inst) {
   log('捕获 XhsHttpInterceptor 实例 #' + h + '（共 ' + S.shieldInstances.length + ' 个）');
 }
 
+function installInterceptHook(X) {
+  X.intercept.implementation = function (chain) {
+    addShieldInstance(this);
+    captureFromChain(this, chain);
+    return this.intercept(chain);
+  };
+}
+
+// 通用：在拦截器 intercept 里抓 App 自身请求现场（跳过我们的假 chain）
+function captureFromChain(self, chain) {
+  var rec = null;
+  var isFake = false;
+  try { isFake = ('' + chain.getClass().getName()).indexOf('com.re.xhs.') === 0; } catch (e0) {}
+  if (isFake) return;
+  try {
+    var req = chain.request();
+    var u = req.url().toString();
+    if (u.indexOf('xiaohongshu.com') >= 0) {
+      rec = { url: u, method: req.method(), headers: [], body: null, code: null,
+              via: '' + self.getClass().getName() };
+      var hh = req.headers();
+      for (var i = 0; i < hh.size(); i++) rec.headers.push([hh.name(i), hh.value(i)]);
+      try {
+        var bd = req.body();
+        if (bd !== null) {
+          var Buf = Java.use('okio.Buffer');
+          var b = Buf.$new();
+          bd.writeTo(b);
+          rec.body = b.readUtf8(4096);
+        }
+      } catch (e2) { rec.body = 'readfail:' + e2; }
+      S.recentReqs.push(rec);
+      if (S.recentReqs.length > 12) S.recentReqs.shift();
+    }
+  } catch (e1) {}
+}
+
+// TinyInterceptor（n0c.p）是 edith 请求必经的签名拦截器，装同样的抓取
+function installTinyCaptureHook(X) {
+  X.intercept.implementation = function (chain) {
+    captureFromChain(this, chain);
+    return this.intercept(chain);
+  };
+}
+
 function ensureHooks(tinyReady) {
   // 1) shield 实例捕获：先 Java.choose 捞现存实例（不会触发类初始化），
-  //    确认类已被 App 自己加载后再 Java.use 装 hook（避免提前触发 static init）
-  if (!S.shieldHookOk && tinyReady) {
+  //    确认类已被 App 自己加载后再装 hook。
+  //    注意：Petal 插件框架下网络栈可能跑在插件 ClassLoader，Java.use 默认
+  //    只解析到主 loader 的同名类——必须按实例自己的 ClassLoader 逐份 hook，
+  //    否则实例能捞到、intercept 钩却永远不触发（实测真机就是这样）。
+  if (tinyReady) {
     try {
       Java.choose('com.xingin.shield.http.XhsHttpInterceptor', {
-        onMatch: function (inst) { addShieldInstance(inst); },
+        onMatch: function (inst) {
+          addShieldInstance(inst);
+          try {
+            var loader = inst.getClass().getClassLoader();
+            var factory = Java.ClassFactory.get(loader);
+            var X = factory.use('com.xingin.shield.http.XhsHttpInterceptor');
+            var ch = X.class.hashCode();
+            if (S.hookedInterceptCls[ch]) return;
+            S.hookedInterceptCls[ch] = 1;
+            installInterceptHook(X);
+            S.shieldHookOk = true;
+            log('shield intercept hook 已安装（loader=' + loader + '）');
+          } catch (e) { S.lastErr.hookShield = '' + e; }
+        },
         onComplete: function () {}
       });
     } catch (e) { S.lastErr.chooseShield = '' + e; }
-    if (S.shieldInstances.length > 0) {
-      try {
-        var X = Java.use('com.xingin.shield.http.XhsHttpInterceptor');
-        X.intercept.implementation = function (chain) {
-          addShieldInstance(this);
-          return this.intercept(chain);
-        };
-        S.shieldHookOk = true;
-        log('shield intercept hook 已安装');
-      } catch (e) { S.lastErr.hookShield = '' + e; }
-    }
   }
+  // 1b) n0c.p 抓取 hook 已停用（实测触发静默自杀，待查）
   // 2) 真实请求样本抓取（okhttp 内部类，提前 Java.use 无上下文依赖，但统一等 tiny 就绪后装）
   if (!S.sampleHookOk && tinyReady) {
     try {
@@ -534,6 +587,165 @@ function javaWarming() {
   return typeof Java === 'undefined' || !Java.available;
 }
 
+/* ---------- 借 App 的 edith 客户端直接发请求（fetch RPC） ---------- */
+var gApiClient = null;
+var gFetchExec = null;       // 专用 Java 线程：gum 线程 Java 栈只有 ~1MB，深拦截器链会 StackOverflow
+var gFetchArgs = null;
+var gFetchCallableCls = null;
+function findApiClient() {
+  if (gApiClient) return gApiClient;
+  var found = null;
+  Java.choose('okhttp3.OkHttpClient', {
+    onMatch: function (inst) {
+      try {
+        var list = inst.interceptors();
+        var hasTiny = false, hasShield = false;
+        for (var i = 0; i < list.size(); i++) {
+          var n = '' + list.get(i).getClass().getName();
+          if (n === 'n0c.p') hasTiny = true;
+          if (n.indexOf('XhsHttpInterceptor') >= 0) hasShield = true;
+        }
+        if (hasTiny && hasShield) { found = Java.retain(inst); return 'stop'; }
+      } catch (e) {}
+    },
+    onComplete: function () {}
+  });
+  if (!found) throw new Error('没找到带 n0c.p+XhsHttpInterceptor 的 OkHttpClient 实例');
+  gApiClient = found;
+  return found;
+}
+
+function appFetch(method, url, bodyB64, contentType) {
+  var client = findApiClient();
+  var rb = Java.use('okhttp3.Request$Builder').$new().url(url);
+  var bodyArr = bodyB64 ? b64decode(bodyB64) : null;
+  if (bodyArr && bodyArr.length > 0) {
+    var MediaType = Java.use('okhttp3.MediaType');
+    var RequestBody = Java.use('okhttp3.RequestBody');
+    var ct = contentType || 'application/x-www-form-urlencoded; charset=utf-8';
+    var mt = null;
+    try { mt = MediaType.parse(ct); } catch (e) { mt = MediaType.get(ct); }
+    rb.method(method, RequestBody.create(mt, Java.array('byte', bodyArr)));
+  } else {
+    rb.method(method, null);
+  }
+  var resp = client.newCall(rb.build()).execute();
+  try {
+    var hs = [];
+    var h = resp.headers();
+    for (var i = 0; i < h.size(); i++) hs.push([h.name(i), h.value(i)]);
+    var bodyStr = '';
+    try { bodyStr = '' + resp.body().string(); } catch (e1) { bodyStr = 'readfail:' + e1; }
+    return { code: resp.code(), headers: hs, body: bodyStr };
+  } finally {
+    resp.close();
+  }
+}
+
+/* ---------- 线程池执行 fetch（避开 gum 线程的小 Java 栈） ---------- */
+// gFetchArgs = [kind, ...]；kind: 'app' = 借 App 的 okhttp 客户端，'raw' = HttpsURLConnection 裸发
+function rawFetch(url, headersArr, bodyB64) {
+  var URL = Java.use('java.net.URL');
+  var conn = Java.cast(URL.$new(url).openConnection(),
+                       Java.use('java.net.HttpURLConnection'));
+  conn.setConnectTimeout(15000);
+  conn.setReadTimeout(15000);
+  conn.setRequestMethod('GET');
+  var bodyArr = bodyB64 ? b64decode(bodyB64) : null;
+  if (bodyArr && bodyArr.length > 0) conn.setRequestMethod('POST');
+  for (var i = 0; i < headersArr.length; i++) {
+    conn.setRequestProperty(headersArr[i][0], headersArr[i][1]);
+  }
+  if (bodyArr && bodyArr.length > 0) {
+    conn.setDoOutput(true);
+    var os = conn.getOutputStream();
+    os.write(Java.array('byte', bodyArr));
+    os.flush();
+    os.close();
+  }
+  var code = conn.getResponseCode();
+  var stream = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+  var text = '';
+  if (stream !== null) {
+    var ByteArray = Java.use('java.io.ByteArrayOutputStream');
+    var bos = ByteArray.$new();
+    var buf = Java.array('byte', new Array(8192).fill(0));
+    var n;
+    while ((n = stream.read(buf)) !== -1) bos.write(buf, 0, n);
+    text = '' + bos.toString('UTF-8');
+    stream.close();
+  }
+  var hs = [];
+  var hi = 1;
+  while (true) {
+    var hk = conn.getHeaderFieldKey(hi);
+    if (hk === null) break;
+    hs.push(['' + hk, '' + conn.getHeaderField(hi)]);
+    hi++;
+    if (hi > 64) break;
+  }
+  conn.disconnect();
+  return { code: code, headers: hs, body: text };
+}
+
+function runOnFetchThread(kind, args) {
+  if (!gFetchExec) {
+    gFetchExec = Java.use('java.util.concurrent.Executors').newSingleThreadExecutor();
+    gFetchCallableCls = Java.registerClass({
+      name: 'com.re.xhs.FetchTask',
+      implements: [Java.use('java.util.concurrent.Callable')],
+      methods: {
+        call: {
+          returnType: 'java.lang.Object', argumentTypes: [],
+          implementation: function () {
+            try {
+              var a = gFetchArgs;
+              if (a[0] === 'raw') {
+                return JSON.stringify(rawFetch(a[1], a[2], a[3]));
+              }
+              return JSON.stringify(appFetch(a[1], a[2], a[3], a[4]));
+            } catch (e) {
+              return JSON.stringify({ fetchError: '' + e + '\n' + (e && e.stack ? e.stack : '') });
+            }
+          }
+        }
+      }
+    });
+  }
+  gFetchArgs = [kind].concat(args);
+  var future = gFetchExec.submit(gFetchCallableCls.$new());
+  var out = JSON.parse('' + future.get());
+  if (out.fetchError) throw new Error(out.fetchError);
+  return out;
+}
+
+function appFetchAsync(method, url, bodyB64, contentType) {
+  return runOnFetchThread('app', [method, url, bodyB64, contentType]);
+}
+
+/* ---------- 账号状态（userstate RPC） ---------- */
+function userState() {
+  function call0(obj, name) {
+    try {
+      var m = obj.getClass().getMethod(name, []);
+      m.setAccessible(true);
+      var r = m.invoke(obj, []);
+      return r === null ? null : ('' + r);
+    } catch (e) { return null; }
+  }
+  var KClass = Java.use('kotlin.jvm.internal.Reflection').getOrCreateKotlinClass(
+    Java.use('android.xingin.com.spi.account.IUserService').class);
+  var svc = Java.use('com.xingin.spi.service.ServiceLoaderKtKt')
+    .service$default(KClass, null, null, 3, null);
+  if (!svc) return { error: 'IUserService 不可用' };
+  return {
+    isLogin: call0(svc, 'isLogin'),
+    sessionId: call0(svc, 'getSessionId'),
+    userId: call0(svc, 'getUserId'),
+    loginStatus: call0(svc, 'getLoginStatus')
+  };
+}
+
 rpc.exports = {
   sign: function (method, url, bodyB64) {
     if (javaWarming()) throw new Error('Java VM 尚未就绪');
@@ -567,6 +779,55 @@ rpc.exports = {
   },
   debugresp: function () {
     return S.recentResp.slice();
+  },
+  debugreqs: function () {
+    return S.recentReqs.slice();
+  },
+  evaljs: function (code) {
+    // 通用排障探针：在 Java.perform 里执行任意 JS，返回值 JSON.stringify 后回传
+    if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var result = null, err = null;
+    Java.perform(function () {
+      try {
+        var r = eval('(function(){' + code + '\n})()');
+        result = JSON.stringify(r);
+      } catch (e) { err = '' + e + '\n' + (e && e.stack ? e.stack : ''); }
+    });
+    if (err) throw new Error(err);
+    return result;
+  },
+  fetch: function (method, url, bodyB64, contentType) {
+    // 借 App 的 edith OkHttpClient 直接执行请求：完整拦截器链（tiny/legacy/
+    // shield/xy-common-params 全自动）+ 本机 IP + App 会话。宿主只收发数据。
+    if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var result = null, err = null;
+    Java.perform(function () {
+      try { result = appFetchAsync(method, url, bodyB64 || '', contentType || ''); }
+      catch (e) { err = '' + e + '\n' + (e && e.$stack ? e.$stack : ''); }
+    });
+    if (err) throw new Error(err);
+    return result;
+  },
+  rawfetch: function (url, headersArr, bodyB64) {
+    // 签名后裸发：HttpsURLConnection 在设备上执行（手机 IP），不碰 okhttp 拦截器链。
+    // headersArr = [[k,v],...]，由宿主先用 sign RPC 算好。
+    if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var result = null, err = null;
+    Java.perform(function () {
+      try { result = runOnFetchThread('raw', [url, headersArr || [], bodyB64 || '']); }
+      catch (e) { err = '' + e + '\n' + (e && e.$stack ? e.$stack : ''); }
+    });
+    if (err) throw new Error(err);
+    return result;
+  },
+  userstate: function () {
+    if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var result = null, err = null;
+    Java.perform(function () {
+      try { result = userState(); } catch (e) { err = '' + e; }
+    });
+    if (err) throw new Error(err);
+    return result;
   },
   rotateshield: function (xyterstr) {
     if (javaWarming()) throw new Error('Java VM 尚未就绪');

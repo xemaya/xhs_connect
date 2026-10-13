@@ -30,26 +30,64 @@ rlog('standalone init start');
 
 /* ---- 1. 自杀封堵（native，先于一切） ---- */
 (function () {
-  var seen = {};
-  ['exit', '_exit', '_Exit'].forEach(function (name) {
-    var addr = Module.findGlobalExportByName(name);
-    if (!addr || seen[addr.toString()]) return;
-    seen[addr.toString()] = 1;
+  function modOf(addr) {
     try {
-      Interceptor.replace(addr, new NativeCallback(function (code) {
-        rlog('拦截 ' + name + '(' + code + ')');
-        Thread.sleep(24 * 3600);
-      }, 'void', ['int']));
-    } catch (e) { rlog('封堵 ' + name + ' 失败: ' + e); }
-  });
+      var m = Process.findModuleByAddress(addr);
+      if (m) return m.name + '+0x' + addr.sub(m.base).toString(16);
+    } catch (e) {}
+    return '?' + addr;
+  }
+  // exit 家族 + abort：replace 成"记日志并正常返回"（干净的 C 返回，不动寄存器）。
+  // 不用睡死（主线程睡死会被 ANR 杀）；不用 attach+pc=lr（实测会破坏运行时状态）。
+  function replaceVoid(name, nArgs) {
+    var addr = Module.findGlobalExportByName(name);
+    if (!addr) return;
+    var t = [];
+    for (var i = 0; i < nArgs; i++) t.push('int');
+    try {
+      Interceptor.replace(addr, new NativeCallback(function (a0, a1, a2) {
+        rlog('中和 ' + name + '(' + a0 + ')');
+      }, 'void', t));
+      rlog('中和钩已装 ' + name);
+    } catch (e) { rlog('中和 ' + name + ' 失败: ' + e); }
+  }
+  ['exit', '_exit', '_Exit'].forEach(function (n) { replaceVoid(n, 1); });
+  replaceVoid('abort', 0);
+  // kill/tgkill：attach 降级致命信号为 0（不动 pc，安全）；ART GC 的 32/33 放行
+  function downgrade(name, sigIdx) {
+    var addr = Module.findGlobalExportByName(name);
+    if (!addr) return;
+    try {
+      Interceptor.attach(addr, {
+        onEnter: function (args) {
+          var sig = args[sigIdx].toInt32();
+          if (sig === 9 || sig === 15) {
+            rlog('降级 ' + name + ' sig=' + sig + ' 来自 ' + modOf(this.context.lr));
+            args[sigIdx] = ptr(0);
+          }
+        }
+      });
+      rlog('降级钩已装 ' + name);
+    } catch (e) { rlog('降级 ' + name + ' 失败: ' + e); }
+  }
+  downgrade('kill', 1);
+  downgrade('tgkill', 2);
+  // syscall 直通监控：exit(93)/exit_group(94)/kill(129)/tgkill(131) 记来源并改成 getpid(172)
   try {
-    var ab = Module.findGlobalExportByName('abort');
-    if (ab && !seen[ab.toString()]) {
-      Interceptor.replace(ab, new NativeCallback(function () {
-        rlog('吞掉 abort()（签名校验失败开放兜底）');
-      }, 'void', []));
+    var sysAddr = Module.findGlobalExportByName('syscall');
+    if (sysAddr) {
+      Interceptor.attach(sysAddr, {
+        onEnter: function (args) {
+          var nr = args[0].toInt32();
+          if (nr === 93 || nr === 94 || nr === 129 || nr === 131) {
+            rlog('!!! syscall(' + nr + ') 自杀调用，来自 ' + modOf(this.context.lr) + '，已改 getpid');
+            args[0] = ptr(172);
+          }
+        }
+      });
+      rlog('syscall 自杀监控已装');
     }
-  } catch (e) { rlog('封堵 abort 失败: ' + e); }
+  } catch (e) { rlog('装 syscall 监控失败: ' + e); }
 })();
 
 /* ---- 2. 内嵌 Java 桥（紧随其后的文本即 java-bridge.js 原文） ---- */
@@ -73,9 +111,38 @@ try {
       Sig.hashCode.implementation = function () { return -1083242518; };
       rlog('Signature.hashCode 早期钩 OK，自测=' + Sig.$new('AAAA').hashCode());
     } catch (e) { rlog('hashCode hook fail: ' + e); }
+    // Java 层自杀封堵：killProcess/System.exit/Runtime.exit/halt（都是框架类，可早期钩）
+    try {
+      Java.use('android.os.Process').killProcess.implementation = function (pid) {
+        rlog('拦截 Process.killProcess(' + pid + ')');
+      };
+      Java.use('java.lang.System').exit.implementation = function (c) {
+        rlog('拦截 System.exit(' + c + ')');
+      };
+      var Rt = Java.use('java.lang.Runtime');
+      Rt.exit.implementation = function (c) { rlog('拦截 Runtime.exit(' + c + ')'); };
+      Rt.halt.implementation = function (c) { rlog('拦截 Runtime.halt(' + c + ')'); };
+      rlog('Java 层自杀封堵 OK');
+    } catch (e) { rlog('Java 自杀封堵 fail: ' + e); }
   });
   rlog('vm.perform returned');
 } catch (e) { rlog('vm.perform fail: ' + e); }
+
+
+/* ---- 3.5 主进程门控：gadget 在每个进程（:pushservice/:longlinkNew…）都会加载，
+   都跑 server 段会导致多进程抢连宿主、互相顶线（实测 BrokenPipe 之源）。
+   只有主进程（cmdline 精确等于包名）才加载签名逻辑和 RPC 服务。 ---- */
+var IS_MAIN_PROC = false;
+try {
+  var pf = new File('/proc/self/cmdline', 'r');
+  var pbuf = new Uint8Array(pf.readBytes(64));
+  var pn = pbuf.byteLength;
+  pf.close();
+  var pname = '';
+  for (var pi = 0; pi < pn && pbuf[pi] !== 0; pi++) pname += String.fromCharCode(pbuf[pi]);
+  IS_MAIN_PROC = true;  // 门控暂时停用（排查多进程问题）
+  rlog('进程名=' + pname + ' 主进程=' + IS_MAIN_PROC);
+} catch (e) { rlog('读进程名失败: ' + e); }
 
 /* ---- 4. sign.js 逻辑（含其 rpc.exports 注册块；frida 运行时自带 rpc 全局） ---- */
 '''
@@ -158,24 +225,31 @@ function onConnClosed(conn) {
   try { conn.close(); } catch (e) {}
   if (typeof gConn !== 'undefined' && gConn === conn) {
     gConn = null;
-    rlog('宿主连接断开，重连');
-    connectToHost(30);
+    rlog('宿主连接断开，2s 后重连');
+    scheduleConnect(2000);
   }
 }
 // 反向通道：script 主动连 Mac 宿主（经 adb reverse tcp:27045）。
 // 连接常驻并全局持有防 GC；宿主先发请求、脚本回响应（行分隔 JSON）。
+// 重试必须带间隔：宿主进程退出到下次命令起监听之间有真空期，
+// 无间隔重试会在毫秒内烧光次数，之后只能重启 App 才能恢复通道。
 var gConn = null;
-function connectToHost(n) {
+function connectToHost() {
   Socket.connect({ family: 'ipv4', host: '127.0.0.1', port: 27045 }).then(function (conn) {
     gConn = conn;
     rlog('已接入宿主签名服务');
     readLoop(conn, { text: '' });
   }).catch(function (e) {
-    rlog('connect 宿主失败(' + e + ')，剩余重试 ' + n);
-    if (n > 0) connectToHost(n - 1);
+    rlog('connect 宿主失败(' + e + ')，3s 后重试');
+    scheduleConnect(3000);
   });
 }
-connectToHost(30);
+function scheduleConnect(ms) {
+  // setTimeout 在 gadget QuickJS 可用；递归不重、次数不限，App 活着就持续等宿主
+  try { setTimeout(connectToHost, ms); }
+  catch (e) { rlog('setTimeout 不可用，直接重试: ' + e); connectToHost(); }
+}
+connectToHost();
 
 // 正向监听兜底（accept 在本环境疑似不派发，留着无害）
 try {
@@ -207,8 +281,10 @@ def main():
     core = sign[start:]
 
     out = (HEADER + bridge + MIDDLE
+           + 'if (IS_MAIN_PROC) {\n'
            + 'try {\n' + core + '\n} catch (e) { rlog("core 段异常: " + e + " stack=" + (e && e.stack)); }\n'
-           + SERVER)
+           + SERVER + '\n}\n'
+           + 'rlog("非主进程跳过 core/server 或已完成加载");\n')
     dst = os.path.join(DECODED_LIB, 'libfrida-gadget.script.so')
     open(dst, 'w', encoding='utf-8').write(out)
     print('script bytes:', len(out), '->', dst)

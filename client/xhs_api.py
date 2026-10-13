@@ -19,12 +19,14 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import uuid
 
 import frida
 import requests
@@ -376,6 +378,8 @@ class XhsClient:
 
     # ---------- HTTP ----------
     def _send(self, method, url, body=b'', content_type=None, _retries=2):
+        if self.cfg['gadget']:
+            return self._send_via_device(method, url, body, content_type, _retries)
         last_exc = None
         for attempt in range(_retries + 1):
             try:
@@ -405,6 +409,30 @@ class XhsClient:
                     log(f'轮换失败（{e}）')
                     if not self._reattach():
                         raise
+                continue
+            return r
+        raise last_exc
+
+    def _send_via_device(self, method, url, body=b'', content_type=None, _retries=2):
+        """真机形态：请求交给 App 的 edith OkHttpClient 执行（fetch RPC）。
+        完整拦截器链 + 手机 IP + App 会话；签名/会话/IP 绑定问题一并消失。
+        App 进程会被看门狗周期性杀掉并自愈，连接断开时重连重试。"""
+        body_b64 = base64.b64encode(body).decode() if body else ''
+        last_exc = None
+        for attempt in range(_retries + 1):
+            try:
+                res = self._rpc('fetch', method, url, body_b64, content_type or '')
+            except (ConnectionError, RuntimeError) as e:
+                last_exc = e
+                log(f'fetch 中断（{type(e).__name__}: {str(e)[:60]}），尝试重连')
+                if attempt < _retries and self._reattach():
+                    continue
+                raise
+            r = DeviceResp(res)
+            # native 的 406+xy-ter-str 轮换在 App 拦截器内透明完成；仍 406 才兜底轮换
+            if r.status_code == 406 and 'xy-ter-str' in r.headers and attempt < _retries:
+                log('收到 406 + xy-ter-str，轮换 shield 密钥后重试')
+                self._rpc('rotateshield', r.headers['xy-ter-str'])
                 continue
             return r
         raise last_exc
@@ -452,19 +480,44 @@ class XhsClient:
 
     # ---------- API ----------
     def search_notes(self, keyword, page=1, page_size=20):
+        """完整参数集（对齐 rc0.h 构建器）——缺参数服务端会 500 NPE，少到刚好能跑。"""
         params = {
-            'keyword': keyword,
-            'page': page,
-            'page_size': page_size,
-            'sort': 'general',
-            'source': 'explore',
-            'search_tab': 'notes',
+            'keyword': keyword, 'filters': '', 'sort': 'general',
+            'page': page, 'page_size': page_size, 'source': 'explore',
+            'search_id': uuid.uuid4().hex, 'session_id': uuid.uuid4().hex,
+            'api_extra': '', 'page_pos': 0, 'ext_params': '', 'pin_note_id': '',
+            'allow_rewrite': 1, 'geo': '', 'loaded_ad': '',
+            'query_extra_info': '', 'rec_extra_params': '', 'scene': 'search',
+            'is_optimize': 0, 'location_permission': 0, 'device_level': 2,
+            'refresh_type': 1, 'exp_infos': '', 'feed_oaid': '',
+            'known_signal': '', 'ai_mode': 0, 'search_tab': 'notes',
         }
         return self.get('/api/sns/v10/search/notes', params)
+
+    @staticmethod
+    def parse_search_items(j):
+        """v10/search/notes 的 item 结构：{model_type:'note', note:{note_id,xsec_token,title,...}}"""
+        out = []
+        for it in ((j.get('data') or {}).get('items') or []):
+            note = it.get('note') or it.get('note_card') or {}
+            nid = note.get('note_id') or it.get('id') or ''
+            if not nid:
+                mt = it.get('mix_track_id') or ''
+                m = re.search(r'NOTE__([0-9a-f]+)__', mt)
+                nid = m.group(1) if m else ''
+            out.append({
+                'note_id': nid,
+                'xsec_token': note.get('xsec_token') or '',
+                'title': note.get('title') or note.get('display_title') or '',
+                'liked_count': (note.get('interact_info') or {}).get('liked_count'),
+                'user': (note.get('user') or {}).get('nickname'),
+            })
+        return out
 
     def get_note(self, note_id, xsec_token=''):
         params = {
             'note_id': note_id,
+            'xsec_token': xsec_token,
             'page': 1,
             'has_ads_tag': 0,
             'num': 5,
@@ -494,6 +547,19 @@ class XhsClient:
         return self.get('/api/sns/v1/note/basic/homefeed', params)
 
 
+class DeviceResp:
+    """设备内执行（fetch RPC）的响应包装，接口对齐 requests.Response 用到的部分。"""
+
+    def __init__(self, res):
+        self.status_code = res['code']
+        self.text = res.get('body') or ''
+        self.headers = requests.structures.CaseInsensitiveDict(
+            {k: v for k, v in (res.get('headers') or [])})
+
+    def json(self):
+        return json.loads(self.text)
+
+
 def dump_resp(r, limit=600):
     print(f'HTTP {r.status_code}')
     try:
@@ -518,12 +584,18 @@ def main():
     sub.add_parser('homefeed')
     sub.add_parser('basic')
     sub.add_parser('status')
+    sub.add_parser('userstate')
     args = ap.parse_args()
 
     client = XhsClient(spawn=not args.no_spawn, target=args.target)
 
     if args.cmd == 'status':
         print(json.dumps(client._rpc('status'),
+                         ensure_ascii=False, indent=2))
+        return
+
+    if args.cmd == 'userstate':
+        print(json.dumps(client._rpc('userstate'),
                          ensure_ascii=False, indent=2))
         return
 
@@ -545,18 +617,18 @@ def main():
         if j:
             print('success =', j.get('success'), ' code =', j.get('code'),
                   ' msg =', j.get('msg'))
-            items = j.get('data', {}).get('items') or []
+            items = XhsClient.parse_search_items(j)
             print(f'items: {len(items)}')
             for it in items[:5]:
-                card = it.get('note_card', {})
-                print(' -', it.get('id'), '|', card.get('display_title'))
+                print(' -', it['note_id'], '|', it['title'],
+                      '| xsec=', it['xsec_token'][:16] + '...' if it['xsec_token'] else '')
     elif args.cmd == 'note':
         r = client.get_note(args.note_id, args.xsec_token)
         j = dump_resp(r)
         if j:
             print('success =', j.get('success'), ' code =', j.get('code'),
                   ' msg =', j.get('msg'))
-            items = j.get('data', {}).get('items') or []
+            items = (j.get('data') or {}).get('items') or []
             if items:
                 note = items[0].get('note_card', {})
                 print('标题:', note.get('title'))
