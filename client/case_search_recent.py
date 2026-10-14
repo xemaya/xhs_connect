@@ -94,15 +94,24 @@ def main():
     session_id = uuid.uuid4().hex
     with open(args.out, 'w', encoding='utf-8') as fout:
         while kept < args.cap:
-            try:
-                j, items = search_page(client, args.keyword, page, args.sort,
-                                       search_id, session_id, args.page_size)
-            except Exception as e:
-                log(f'第 {page} 页搜索失败（{type(e).__name__}: {str(e)[:60]}），'
-                    '10s 后重试一次')
-                time.sleep(10)
-                j, items = search_page(client, args.keyword, page, args.sort,
-                                       search_id, session_id, args.page_size)
+            # 搜索页重试：最多 4 次，退避 10/30/60s（看门狗发作期可能连续失败）
+            j, items = None, None
+            for attempt in range(4):
+                try:
+                    j, items = search_page(client, args.keyword, page, args.sort,
+                                           search_id, session_id, args.page_size)
+                    break
+                except Exception as e:
+                    wait = 10 * (attempt + 1) * (attempt + 1)
+                    log(f'第 {page} 页搜索失败（{type(e).__name__}: '
+                        f'{str(e)[:60]}），{wait}s 后第 {attempt + 2} 次重试'
+                        if attempt < 3 else f'第 {page} 页彻底失败，收工')
+                    if attempt >= 3:
+                        break
+                    time.sleep(wait)
+            if items is None:
+                log('搜索页连续失败，停止（已抓数据保留）')
+                break
             fresh = [it for it in items if it.get('note_id')]
             log(f'第 {page} 页：{len(fresh)} 条有效（共 {len(items)} 条）')
             if not fresh:
