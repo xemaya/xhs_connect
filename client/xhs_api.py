@@ -237,6 +237,7 @@ class XhsClient:
                     st = self._rpc('status') or {}
                     if st.get('ready'):
                         log('重连后就绪')
+                        self._apply_session()   # 新进程钩子已失效，重新注入登录态
                         return True
                     time.sleep(1)
             except Exception as e:
@@ -247,7 +248,8 @@ class XhsClient:
     # ---------- 启动 / attach ----------
     def _launch_gadget_tcp(self):
         """真机形态：内嵌脚本随 App 启动自加载，主动反向连入本机的监听端口。
-        进程没在跑才 monkey 拉起；然后等脚本连入。"""
+        进程没在跑才拉起。App 在跑但迟迟不连入 = 它握着一条通向已死 listener
+        的半开尸体连接（gadget 不写数据就发现不了），只能 force-stop 重启。"""
         self.tcp._ensure_server()
         if self.tcp.ping():
             log('签名通道在线，直连')
@@ -256,8 +258,19 @@ class XhsClient:
             self._adb('shell', 'monkey', '-p', self.pkg, '-c',
                       'android.intent.category.LAUNCHER', '1')
             log('已拉起 App，等待内嵌脚本反向连入')
-        else:
-            log('App 在跑但通道未建立，等它连入（或重启 App）')
+            self.tcp.wait_conn(timeout=90)
+            return
+        log('App 在跑但通道未建立，先等 8s（gadget 有 2s 重连周期）')
+        try:
+            self.tcp.wait_conn(timeout=8)
+            return
+        except Exception:
+            pass
+        log('8s 未连入，判定尸体连接，force-stop 重启 App')
+        self._adb('shell', 'am', 'force-stop', self.pkg)
+        time.sleep(2)
+        self._adb('shell', 'monkey', '-p', self.pkg, '-c',
+                  'android.intent.category.LAUNCHER', '1')
         self.tcp.wait_conn(timeout=90)
 
     def _launch(self, spawn):
@@ -451,7 +464,8 @@ class XhsClient:
         for attempt in range(_retries + 1):
             try:
                 res = self._rpc('fetch', method, url, body_b64, content_type or '')
-            except (ConnectionError, RuntimeError, frida.InvalidOperationError) as e:
+            except (ConnectionError, RuntimeError, TimeoutError,
+                    frida.InvalidOperationError) as e:
                 last_exc = e
                 log(f'fetch 中断（{type(e).__name__}: {str(e)[:60]}），尝试重连')
                 if attempt < _retries and self._reattach():

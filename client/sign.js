@@ -719,7 +719,20 @@ function runOnFetchThread(kind, args) {
   }
   gFetchArgs = [kind].concat(args);
   var future = gFetchExec.submit(gFetchCallableCls.$new());
-  var out = JSON.parse('' + future.get());
+  var raw;
+  try {
+    // 卡死防护：okhttp execute() 偶发永不返回，单线程 executor 一挂全挂。
+    // 45s 超时后作废 executor（shutdownNow 中断卡死线程）下次重建。
+    var TU = Java.use('java.util.concurrent.TimeUnit');
+    raw = '' + future.get.overload('long', 'java.util.concurrent.TimeUnit')
+        .call(future, 45, TU.SECONDS.value);
+  } catch (e) {
+    try { gFetchExec.shutdownNow(); } catch (e2) {}
+    gFetchExec = null;
+    gApiClient = null;
+    throw new Error('fetch 超时（45s），executor 已重置：' + e);
+  }
+  var out = JSON.parse(raw);
   if (out.fetchError) throw new Error(out.fetchError);
   return out;
 }

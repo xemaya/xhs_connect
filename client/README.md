@@ -212,3 +212,13 @@ r = c.get_note('<note_id>')
   所以 sign.js 里字段/方法访问大量走反射。
 - 反射 `Method.invoke` 返回的对象包装器按声明类型 `Object` 解析方法，
   需 `Java.cast` 回真实类型（见 `javaMapToObj`）。
+
+## 测试用例：按时间窗抓搜索结果（2026-10-14）
+
+```bash
+python case_search_recent.py --keyword "伦敦 二手" --hours 24 --cap 500 --target real
+```
+
+时间倒序翻页 → 逐条取详情 → 按发布时间过滤 → JSONL 落盘（默认 `client/out/`，
+剥掉 comment_list，其余字段全留）。实测样本：`client/out/伦敦二手_最近24h_合并.jsonl`（25 条）。
+翻页要点见 `docs/真机迁移与现场情况.md` 第八节（search_id 会话内固定、去重停止条件）。
