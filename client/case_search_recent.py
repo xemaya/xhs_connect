@@ -40,7 +40,7 @@ def search_page(client, keyword, page, sort, search_id, session_id, page_size=20
         'known_signal': '', 'ai_mode': 0, 'search_tab': 'notes',
     }
     url = f'{HOST}/api/sns/v10/search/notes?' + urllib.parse.urlencode(params)
-    r = client._send_via_device('GET', url)
+    r = client._send('GET', url)   # 走统一通道（XHS_VIA=daemon 时经守护进程）
     j = json.loads(r.text or '{}')
     return j, client.parse_search_items(j)
 

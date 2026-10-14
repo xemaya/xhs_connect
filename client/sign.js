@@ -768,12 +768,13 @@ function userState() {
 // TinyInterceptor(n0c.p) 用 header() 强制覆盖 x-legacy-sid = n2c.b.b()，
 // 所以注入请求头没用，必须钩账号读取点。n2c.b.b() = IUserService.getSessionId()，
 // n2c.b.c() = getLoginUserId()/getUserId()，n2c.b.a() = isLogin 布尔。
+// 坑：petal 插件化让 n2c.b 可能被多个 ClassLoader 各装一份——emu 上实测
+// 钩默认 loader 后线上仍带游客 sid。必须遍历所有 loader 逐份钩。
 var gFakeSid = null;
 var gFakeUid = null;
-var gSessionHooked = false;
-function installSessionHooks() {
-  if (gSessionHooked) return;
-  var B = Java.use('n2c.b');
+var gHookedLoaders = {};   // loader.toString() -> true，重复调用只补新 loader
+function hookSessionInFactory(factory) {
+  var B = factory.use('n2c.b');   // 未加载过会抛错，跳过
   var origB = B.b;
   B.b.implementation = function () {
     return gFakeSid !== null ? gFakeSid : origB.call(this);
@@ -782,7 +783,55 @@ function installSessionHooks() {
   B.c.implementation = function () {
     return gFakeUid !== null ? gFakeUid : origC.call(this);
   };
-  gSessionHooked = true;
+  // 真正的源头：UserServiceImpl。n2c.b 只是代理，petal 多 loader 下
+  // 拦截器链可能读别的 n2c.b 副本；钩 impl 的方法则无论谁读都生效。
+  try {
+    var U = factory.use('com.xingin.account.impl.UserServiceImpl');
+    function hookVal(name, getter) {
+      try {
+        U[name].overloads.forEach(function (ov) {
+          ov.implementation = function () {
+            return gFakeSid !== null ? getter() : ov.call(this);
+          };
+        });
+      } catch (e) {}
+    }
+    hookVal('getSessionId', function () { return gFakeSid; });
+    hookVal('getCurrentSessionId', function () { return gFakeSid; });
+    hookVal('getUserId', function () { return gFakeUid; });
+    hookVal('getCurrentUserId', function () { return gFakeUid; });
+    hookVal('getLoginUserId', function () { return gFakeUid; });
+    hookVal('isLogin', function () { return true; });
+    hookVal('isLoginDelay', function () { return true; });
+    hookVal('getLoginStatus', function () { return 1; });
+  } catch (e) {}
+}
+function installSessionHooks() {
+  var hooked = 0;
+  function hookFactory(factory, key) {
+    if (gHookedLoaders[key]) return;
+    gHookedLoaders[key] = true;   // 先标记，避免失败 loader 反复试
+    try {
+      hookSessionInFactory(factory);
+      hooked++;
+    } catch (e) {}
+  }
+  // 默认 loader
+  hookFactory(Java, '__default__');
+  // TinyInterceptor（n0c.p）所在 loader 里的 n2c.b 副本——请求链实际读的可能是它
+  try {
+    var pLoader = Java.use('n0c.p').class.getClassLoader();
+    if (pLoader !== null) {
+      hookFactory(Java.ClassFactory.get(pLoader), '' + pLoader);
+    }
+  } catch (e) {}
+  // 全 loader 扫描（frida 17 部分版本 enumerateClassLoaders 内部会炸，兜底用）
+  try {
+    Java.enumerateClassLoaders().forEach(function (loader) {
+      hookFactory(Java.ClassFactory.get(loader), '' + loader);
+    });
+  } catch (e) {}
+  return hooked;
 }
 
 rpc.exports = {
@@ -900,13 +949,14 @@ rpc.exports = {
       try {
         gFakeSid = sid ? ('' + sid) : null;
         gFakeUid = uid ? ('' + uid) : null;
-        installSessionHooks();
+        var n = installSessionHooks();
         // jadx 的 f267643a 是别名，运行时字段名是 a（静态单例）；frida 的
         // 静态字段访问在这里不稳，直接反射读。
         var fld = Java.use('n2c.b').class.getDeclaredField('a');
         fld.setAccessible(true);
         var inst = Java.cast(fld.get(null), Java.use('n2c.b'));
-        result = { sid: '' + inst.b(), uid: '' + inst.c(), hooked: gSessionHooked };
+        result = { sid: '' + inst.b(), uid: '' + inst.c(),
+                   hookedLoaders: n, totalLoaders: Object.keys(gHookedLoaders).length };
       } catch (e) { err = '' + e + '\n' + (e && e.$stack ? e.$stack : ''); }
     });
     if (err) throw new Error(err);
