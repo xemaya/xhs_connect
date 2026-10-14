@@ -93,6 +93,7 @@ var S = {
   sampleUrl: null,
   recentUrls: [],           // 最近见过的 edith URL（最多 20 条）
   recentResp: [],           // 最近 edith 响应 [url, code]（最多 30 条，排障用）
+  harvest: [],              // UI 驱动收割：{url,code,body}（最多 80 条）
   recentReqs: [],           // shield intercept 钩到的完整请求 {url,method,headers,body,code}（最多 12 条）
   hookedInterceptCls: {},   // 已装 hook 的 XhsHttpInterceptor 类（按 ClassLoader 区分）
   fakeChainCls: null,       // Java.registerClass 的假 Interceptor.Chain
@@ -342,6 +343,17 @@ function ensureHooks(tinyReady) {
               if (S.recentResp.length > 30) S.recentResp.shift();
             }
           } catch (e) {}
+          // 收割：UI 驱动时 App 自己发的搜索/详情/首页响应，peekBody 不消耗流
+          try {
+            if (u.indexOf('/api/sns/v10/search/notes') >= 0
+                || u.indexOf('/api/sns/v1/note/imagefeed') >= 0
+                || u.indexOf('/api/sns/v6/homefeed') >= 0) {
+              var b = resp.peekBody(4 * 1024 * 1024).string();
+              S.harvest.push({ url: u, code: resp.code(), body: b });
+              if (S.harvest.length > 80) S.harvest.shift();
+              log('收割 ' + resp.code() + ' ' + u.split('?')[0] + ' (' + b.length + 'B)');
+            }
+          } catch (e2) {}
         }
         return resp;
       };
@@ -867,6 +879,12 @@ rpc.exports = {
   },
   debugresp: function () {
     return S.recentResp.slice();
+  },
+  harvest: function (drain) {
+    // drain=1 时取出并清空（默认只读快照）
+    var out = S.harvest.slice();
+    if (drain) S.harvest = [];
+    return out;
   },
   debugreqs: function () {
     return S.recentReqs.slice();
