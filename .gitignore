@@ -5,3 +5,4 @@ __pycache__/
 session.json
 header-template.local.json
 .DS_Store
+session_*.json
