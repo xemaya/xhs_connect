@@ -615,9 +615,14 @@ function findApiClient() {
   return found;
 }
 
-function appFetch(method, url, bodyB64, contentType) {
+function appFetch(method, url, bodyB64, contentType, headersArr) {
   var client = findApiClient();
   var rb = Java.use('okhttp3.Request$Builder').$new().url(url);
+  if (headersArr) {
+    for (var hi = 0; hi < headersArr.length; hi++) {
+      rb.addHeader('' + headersArr[hi][0], '' + headersArr[hi][1]);
+    }
+  }
   var bodyArr = bodyB64 ? b64decode(bodyB64) : null;
   if (bodyArr && bodyArr.length > 0) {
     var MediaType = Java.use('okhttp3.MediaType');
@@ -703,7 +708,7 @@ function runOnFetchThread(kind, args) {
               if (a[0] === 'raw') {
                 return JSON.stringify(rawFetch(a[1], a[2], a[3]));
               }
-              return JSON.stringify(appFetch(a[1], a[2], a[3], a[4]));
+              return JSON.stringify(appFetch(a[1], a[2], a[3], a[4], a[5]));
             } catch (e) {
               return JSON.stringify({ fetchError: '' + e + '\n' + (e && e.stack ? e.stack : '') });
             }
@@ -719,8 +724,8 @@ function runOnFetchThread(kind, args) {
   return out;
 }
 
-function appFetchAsync(method, url, bodyB64, contentType) {
-  return runOnFetchThread('app', [method, url, bodyB64, contentType]);
+function appFetchAsync(method, url, bodyB64, contentType, headersArr) {
+  return runOnFetchThread('app', [method, url, bodyB64, contentType, headersArr || null]);
 }
 
 /* ---------- 账号状态（userstate RPC） ---------- */
@@ -744,6 +749,27 @@ function userState() {
     userId: call0(svc, 'getUserId'),
     loginStatus: call0(svc, 'getLoginStatus')
   };
+}
+
+/* ---------- 会话注入（setsession RPC） ---------- */
+// TinyInterceptor(n0c.p) 用 header() 强制覆盖 x-legacy-sid = n2c.b.b()，
+// 所以注入请求头没用，必须钩账号读取点。n2c.b.b() = IUserService.getSessionId()，
+// n2c.b.c() = getLoginUserId()/getUserId()，n2c.b.a() = isLogin 布尔。
+var gFakeSid = null;
+var gFakeUid = null;
+var gSessionHooked = false;
+function installSessionHooks() {
+  if (gSessionHooked) return;
+  var B = Java.use('n2c.b');
+  var origB = B.b;
+  B.b.implementation = function () {
+    return gFakeSid !== null ? gFakeSid : origB.call(this);
+  };
+  var origC = B.c;
+  B.c.implementation = function () {
+    return gFakeUid !== null ? gFakeUid : origC.call(this);
+  };
+  gSessionHooked = true;
 }
 
 rpc.exports = {
@@ -796,13 +822,18 @@ rpc.exports = {
     if (err) throw new Error(err);
     return result;
   },
-  fetch: function (method, url, bodyB64, contentType) {
+  fetch: function (method, url, bodyB64, contentType, headersJson) {
     // 借 App 的 edith OkHttpClient 直接执行请求：完整拦截器链（tiny/legacy/
     // shield/xy-common-params 全自动）+ 本机 IP + App 会话。宿主只收发数据。
+    // headersJson（可选）= JSON 的 [[k,v],...]，在拦截器链之前加到请求上。
     if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var headersArr = null;
+    if (headersJson) {
+      try { headersArr = JSON.parse(headersJson); } catch (e0) { headersArr = null; }
+    }
     var result = null, err = null;
     Java.perform(function () {
-      try { result = appFetchAsync(method, url, bodyB64 || '', contentType || ''); }
+      try { result = appFetchAsync(method, url, bodyB64 || '', contentType || '', headersArr); }
       catch (e) { err = '' + e + '\n' + (e && e.$stack ? e.$stack : ''); }
     });
     if (err) throw new Error(err);
@@ -846,6 +877,27 @@ rpc.exports = {
     });
     if (err) throw new Error(err);
     return out;
+  },
+  setsession: function (sid, uid) {
+    // 注入登录态：钩 n2c.b 的 b()/c()，让拦截器链每个请求都带我们的 sid/uid。
+    // 传空串清除。进程被看门狗杀掉重启后钩子失效，宿主需在重连后重新调用。
+    if (javaWarming()) throw new Error('Java VM 尚未就绪');
+    var result = null, err = null;
+    Java.perform(function () {
+      try {
+        gFakeSid = sid ? ('' + sid) : null;
+        gFakeUid = uid ? ('' + uid) : null;
+        installSessionHooks();
+        // jadx 的 f267643a 是别名，运行时字段名是 a（静态单例）；frida 的
+        // 静态字段访问在这里不稳，直接反射读。
+        var fld = Java.use('n2c.b').class.getDeclaredField('a');
+        fld.setAccessible(true);
+        var inst = Java.cast(fld.get(null), Java.use('n2c.b'));
+        result = { sid: '' + inst.b(), uid: '' + inst.c(), hooked: gSessionHooked };
+      } catch (e) { err = '' + e + '\n' + (e && e.$stack ? e.$stack : ''); }
+    });
+    if (err) throw new Error(err);
+    return result;
   }
 };
 

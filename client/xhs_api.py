@@ -49,6 +49,9 @@ TARGETS = {
         'pkg': 'com.xingin.xhs',
         'frida_host': os.environ.get('XHS_FRIDA_HOST', '127.0.0.1:44444'),
         'gadget': False,
+        # Mac 直连被风控（406 空响应），模拟器也默认借 App 的 OkHttpClient 发请求；
+        # 设 XHS_EMU_DIRECT=1 可回到直连形态调试签名。
+        'app_fetch': os.environ.get('XHS_EMU_DIRECT') != '1',
     },
     'real': {
         'serial': '101114e',               # 小米 kunzite，Android 15
@@ -159,6 +162,7 @@ class XhsClient:
         self.script = None
         self.session = None
         self.session_id = None
+        self.user_id = None
         self._load_session()
         self._load_header_fallback()
         if self.cfg['gadget']:
@@ -321,6 +325,7 @@ class XhsClient:
                     f"shield(class={st.get('shieldClassInit')}, inst={st.get('shieldInstances')}) "
                     f"sample={st.get('sampleCaptured')} "
                     f"commonParams={st.get('commonParamsOk')}")
+                self._apply_session()
                 return
             time.sleep(2)
         raise RuntimeError('等待签名组件就绪超时，最后状态：\n'
@@ -357,14 +362,36 @@ class XhsClient:
         # 登录态：用保存的 session 覆盖 x-legacy-sid
         # （tiny/shield 的签名摘要不包含该头，签后覆盖安全）
         if self.session_id:
-            headers['x-legacy-sid'] = self.session_id
+            headers['x-legacy-sid'] = self.sid_header
         return headers
+
+    @property
+    def sid_header(self):
+        """x-legacy-sid 的标准形态是 session.<id>；UI 登录抓到的自带前缀，
+        密码登录接口返回的 data.session 是裸 id，这里统一补齐。"""
+        sid = self.session_id or ''
+        if sid and not sid.startswith('session.'):
+            sid = 'session.' + sid
+        return sid
+
+    def _apply_session(self):
+        """把登录态钩进 App 的账号读取点（n2c.b），让 fetch 链路的
+        TinyInterceptor 自动带上我们的 sid。进程重启后钩子失效，
+        所以每次 _wait_ready 成功后都要重新调用。"""
+        if not self.session_id:
+            return
+        try:
+            res = self._rpc('setsession', self.sid_header, self.user_id or '')
+            log(f"会话已注入 App：sid={str(res.get('sid'))[:28]} hooked={res.get('hooked')}")
+        except Exception as e:
+            log(f'会话注入失败（{type(e).__name__}: {str(e)[:60]}），按未登录跑')
 
     # ---------- 登录态持久化 ----------
     def _load_session(self):
         try:
             data = json.load(open(SESSION_JSON, encoding='utf-8'))
             self.session_id = data.get('session')
+            self.user_id = data.get('userid')
             if self.session_id:
                 log(f"已加载登录态（userid={data.get('userid')}, "
                     f"session={self.session_id[:12]}...）")
@@ -378,7 +405,7 @@ class XhsClient:
 
     # ---------- HTTP ----------
     def _send(self, method, url, body=b'', content_type=None, _retries=2):
-        if self.cfg['gadget']:
+        if self.cfg['gadget'] or self.cfg.get('app_fetch'):
             return self._send_via_device(method, url, body, content_type, _retries)
         last_exc = None
         for attempt in range(_retries + 1):
@@ -414,15 +441,17 @@ class XhsClient:
         raise last_exc
 
     def _send_via_device(self, method, url, body=b'', content_type=None, _retries=2):
-        """真机形态：请求交给 App 的 edith OkHttpClient 执行（fetch RPC）。
-        完整拦截器链 + 手机 IP + App 会话；签名/会话/IP 绑定问题一并消失。
+        """真机/模拟器通用：请求交给 App 的 edith OkHttpClient 执行（fetch RPC）。
+        完整拦截器链 + 设备 IP + App 会话；签名/会话/IP 绑定问题一并消失。
+        App 未登录时（如模拟器手动登录后未写回账号 store），靠 _apply_session
+        钩 n2c.b 让 TinyInterceptor 自动带 sid（注请求头没用，会被 header() 覆盖）。
         App 进程会被看门狗周期性杀掉并自愈，连接断开时重连重试。"""
         body_b64 = base64.b64encode(body).decode() if body else ''
         last_exc = None
         for attempt in range(_retries + 1):
             try:
                 res = self._rpc('fetch', method, url, body_b64, content_type or '')
-            except (ConnectionError, RuntimeError) as e:
+            except (ConnectionError, RuntimeError, frida.InvalidOperationError) as e:
                 last_exc = e
                 log(f'fetch 中断（{type(e).__name__}: {str(e)[:60]}），尝试重连')
                 if attempt < _retries and self._reattach():
@@ -580,7 +609,8 @@ def main():
     p = sub.add_parser('search'); p.add_argument('keyword'); p.add_argument('--page', type=int, default=1)
     p = sub.add_parser('note'); p.add_argument('note_id'); p.add_argument('--xsec-token', default='')
     p = sub.add_parser('login'); p.add_argument('--zone', default='1')
-    p.add_argument('--phone', required=True); p.add_argument('--password', required=True)
+    p.add_argument('--phone', default=os.environ.get('XHS_PHONE'))
+    p.add_argument('--password', default=os.environ.get('XHS_PASSWORD'))
     sub.add_parser('homefeed')
     sub.add_parser('basic')
     sub.add_parser('status')
@@ -600,6 +630,9 @@ def main():
         return
 
     if args.cmd == 'login':
+        if not args.phone or not args.password:
+            print('需要 --phone/--password 或环境变量 XHS_PHONE/XHS_PASSWORD')
+            sys.exit(2)
         r = client.login_password(args.zone, args.phone, args.password)
         j = dump_resp(r, limit=1200)
         if j:
@@ -628,12 +661,23 @@ def main():
         if j:
             print('success =', j.get('success'), ' code =', j.get('code'),
                   ' msg =', j.get('msg'))
-            items = (j.get('data') or {}).get('items') or []
-            if items:
-                note = items[0].get('note_card', {})
+            data = j.get('data') or []
+            # data 是 list：data[0].note_list[0] 是笔记本体，user/comment_list 同级
+            if isinstance(data, list) and data:
+                entry = data[0]
+                notes = entry.get('note_list') or []
+                note = notes[0] if notes else {}
                 print('标题:', note.get('title'))
-                print('作者:', (note.get('user') or {}).get('nickname'))
-                print('点赞:', (note.get('interact_info') or {}).get('liked_count'))
+                print('作者:', (entry.get('user') or {}).get('nickname'))
+                print('正文:', str(note.get('desc'))[:200])
+                print('时间:', note.get('time'))
+                print('图片数:', len(note.get('images_list') or []),
+                      ' 类型:', note.get('type'))
+                comments = entry.get('comment_list') or []
+                print('评论数:', len(comments))
+                for cmt in comments[:3]:
+                    print('  -', (cmt.get('user_info') or {}).get('nickname'),
+                          ':', str(cmt.get('content'))[:60])
     elif args.cmd == 'homefeed':
         r = client.homefeed()
         j = dump_resp(r)
