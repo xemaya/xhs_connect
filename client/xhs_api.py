@@ -604,6 +604,51 @@ class XhsClient:
             })
         return r
 
+    # ---------- 短信验证码登录（三步：发码 → 验码 → 登录） ----------
+    def send_sms_code(self, zone, phone):
+        """GET /api/sns/v1/system_service/vfc_code"""
+        return self.get('/api/sns/v1/system_service/vfc_code',
+                        {'phone': phone, 'zone': zone, 'type': 'login'})
+
+    def check_sms_code(self, zone, phone, code):
+        """GET check_code → SmsToken{exists, token}；exists=false 说明是新用户要注册"""
+        r = self.get('/api/sns/v1/system_service/check_code',
+                     {'phone': phone, 'zone': zone, 'code': code, 'type': 'login'})
+        j = r.json() if r.text else {}
+        return r, (j.get('data') or {})
+
+    def login_sms_code(self, zone, phone, mobile_token):
+        """POST /api/sns/v4/user/login/code。成功后备份旧 session.json 再写入新登录态。"""
+        form = {'mobile_token': mobile_token, 'zone': zone, 'phone': phone}
+        try:
+            dev_params = self._rpc('loginparams')
+            log(f'登录设备参数 {len(dev_params)} 项')
+            form.update({k: ('' if v is None else str(v)) for k, v in dev_params.items()})
+        except Exception as e:
+            log(f'取登录设备参数失败（{e}），只带基础三项')
+        r = self.post_form('/api/sns/v4/user/login/code', form)
+        j = r.json() if r.text else {}
+        data = j.get('data') or {}
+        if j.get('success') and data.get('session'):
+            # 换号前备份旧登录态
+            try:
+                old = json.load(open(SESSION_JSON, encoding='utf-8'))
+                if old.get('userid') and old.get('userid') != (data.get('userid') or data.get('user_id')):
+                    bak = SESSION_JSON.replace('.json', f"_{old['userid']}.json")
+                    json.dump(old, open(bak, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+                    log(f'旧登录态已备份 {bak}')
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            self.session_id = data['session']
+            self._save_session({
+                'session': data.get('session'),
+                'userid': data.get('userid') or data.get('user_id'),
+                'secure_session': data.get('secure_session'),
+                'phone': phone, 'zone': zone,
+                'saved_at': int(time.time()),
+            })
+        return r
+
     # ---------- API ----------
     def search_notes(self, keyword, page=1, page_size=20):
         """完整参数集（对齐 rc0.h 构建器）——缺参数服务端会 500 NPE，少到刚好能跑。"""
@@ -708,6 +753,11 @@ def main():
     p = sub.add_parser('login'); p.add_argument('--zone', default='1')
     p.add_argument('--phone', default=os.environ.get('XHS_PHONE'))
     p.add_argument('--password', default=os.environ.get('XHS_PASSWORD'))
+    p = sub.add_parser('sms-send'); p.add_argument('--zone', default='1')
+    p.add_argument('--phone', required=True)
+    p = sub.add_parser('sms-login'); p.add_argument('--zone', default='1')
+    p.add_argument('--phone', required=True)
+    p.add_argument('--code', required=True)
     sub.add_parser('homefeed')
     sub.add_parser('basic')
     sub.add_parser('status')
@@ -738,6 +788,36 @@ def main():
             data = j.get('data') or {}
             print('userid =', data.get('userid') or data.get('user_id'))
             sess = data.get('session') or ''
+            print('session =', sess[:12] + '...' if sess else None)
+        return
+
+    if args.cmd == 'sms-send':
+        r = client.send_sms_code(args.zone, args.phone)
+        j = dump_resp(r, limit=800)
+        if j:
+            print('success =', j.get('success'), ' code =', j.get('code'),
+                  ' msg =', j.get('msg'))
+        return
+
+    if args.cmd == 'sms-login':
+        r, data = client.check_sms_code(args.zone, args.phone, args.code)
+        j = dump_resp(r, limit=800)
+        token = data.get('token')
+        exists = data.get('exists')
+        print('exists =', exists, ' token =', (token or '')[:12] + '...' if token else None)
+        if not token:
+            print('验码失败，未拿到 mobile_token')
+            return
+        if exists is False:
+            print('注意：新用户（exists=false），login/code 可能转注册流程')
+        r2 = client.login_sms_code(args.zone, args.phone, token)
+        j2 = dump_resp(r2, limit=1200)
+        if j2:
+            print('success =', j2.get('success'), ' code =', j2.get('code'),
+                  ' msg =', j2.get('msg'))
+            d2 = j2.get('data') or {}
+            print('userid =', d2.get('userid') or d2.get('user_id'))
+            sess = d2.get('session') or ''
             print('session =', sess[:12] + '...' if sess else None)
         return
 
