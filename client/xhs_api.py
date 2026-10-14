@@ -150,6 +150,53 @@ class TcpRpc:
             return False
 
 
+class DaemonSender:
+    """设备侧 app_process 守护进程（xhs-sender/Sender.java）的客户端。
+    与 xhs App 进程完全无关：没有看门狗、没有自杀。Mac 经 adb forward 连入。
+    协议与用法见 docs 第八节。"""
+
+    def __init__(self, serial, port=27046):
+        self.serial = serial
+        self.port = port
+
+    def _adb(self, *args):
+        return subprocess.run([ADB, '-s', self.serial, *args],
+                              capture_output=True, timeout=30)
+
+    def ensure(self):
+        """守护进程不在就拉起；forward 不在就建。"""
+        self._adb('forward', f'tcp:{self.port}', f'tcp:{self.port}')
+        r = self._adb('shell', 'pgrep', '-f', 'app_process')
+        if r.returncode != 0 or not r.stdout.strip():
+            self._adb('shell', 'CLASSPATH=/data/local/tmp/sender.dex',
+                      'setsid', 'app_process', '/', 'Sender', str(self.port),
+                      '>', '/data/local/tmp/sender.log', '2>&1', '<', '/dev/null',
+                      '&')
+            time.sleep(2)
+
+    def fetch(self, method, url, headers, body=b'', timeout=40):
+        """headers = [[k,v],...]。返回 dict(code/headers/body)。"""
+        self.ensure()
+        s = socket.create_connection(('127.0.0.1', self.port), timeout=10)
+        s.settimeout(timeout)
+        try:
+            f = s.makefile('rwb')
+            req = {'id': 1, 'method': method, 'url': url,
+                   'headers': headers,
+                   'bodyB64': base64.b64encode(body).decode() if body else ''}
+            f.write(json.dumps(req).encode('utf-8') + b'\n')
+            f.flush()
+            line = f.readline()
+        finally:
+            s.close()
+        if not line:
+            raise ConnectionError('守护进程无响应')
+        resp = json.loads(line.decode('utf-8'))
+        if resp.get('fetchError'):
+            raise RuntimeError(resp['fetchError'])
+        return resp
+
+
 
 class XhsClient:
     def __init__(self, spawn=True, ready_timeout=120, target=None):
@@ -163,6 +210,7 @@ class XhsClient:
         self.session = None
         self.session_id = None
         self.user_id = None
+        self.daemon = None
         self._load_session()
         self._load_header_fallback()
         if self.cfg['gadget']:
@@ -418,6 +466,9 @@ class XhsClient:
 
     # ---------- HTTP ----------
     def _send(self, method, url, body=b'', content_type=None, _retries=2):
+        via = os.environ.get('XHS_VIA', '')
+        if via == 'daemon':
+            return self._send_via_daemon(method, url, body, content_type, _retries)
         if self.cfg['gadget'] or self.cfg.get('app_fetch'):
             return self._send_via_device(method, url, body, content_type, _retries)
         last_exc = None
@@ -449,6 +500,38 @@ class XhsClient:
                     log(f'轮换失败（{e}）')
                     if not self._reattach():
                         raise
+                continue
+            return r
+        raise last_exc
+
+    def _send_via_daemon(self, method, url, body=b'', content_type=None, _retries=2):
+        """守护进程形态：签名仍借 App（sign RPC，轻量），发送走设备侧的
+        app_process 守护进程（HttpsURLConnection，无看门狗）。
+        A/B 实验证明它与 App 内 rawfetch 同通道可信度（见文档第八节）。"""
+        if self.daemon is None:
+            self.daemon = DaemonSender(self.cfg['serial'])
+        last_exc = None
+        for attempt in range(_retries + 1):
+            try:
+                pre = self.http.prepare_request(
+                    requests.Request(method, url, data=body if body else None))
+                headers = self.sign(method, pre.url, body)
+                if content_type:
+                    headers['Content-Type'] = content_type
+                res = self.daemon.fetch(method, pre.url,
+                                        [[k, str(v)] for k, v in headers.items()],
+                                        body)
+            except (ConnectionError, RuntimeError, TimeoutError, OSError,
+                    frida.InvalidOperationError) as e:
+                last_exc = e
+                log(f'daemon 发送失败（{type(e).__name__}: {str(e)[:60]}），重连重试')
+                if attempt < _retries and self._reattach():
+                    continue
+                raise
+            r = DeviceResp(res)
+            if r.status_code == 406 and 'xy-ter-str' in r.headers and attempt < _retries:
+                log('收到 406 + xy-ter-str，轮换 shield 密钥后重试')
+                self._rpc('rotateshield', r.headers['xy-ter-str'])
                 continue
             return r
         raise last_exc
