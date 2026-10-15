@@ -5,6 +5,7 @@
 前置：搜索页已打开且有结果；mitmdump 收割模式在跑。
 """
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -34,6 +35,24 @@ def focus():
     return ''
 
 
+def research(keyword):
+    """回搜索页：首页 → 放大镜 → 清空输入 → 关键词 → 搜索"""
+    adb('shell', 'am', 'start', '-n', f'{PKG}/com.xingin.xhs.index.v2.IndexActivityV2')
+    time.sleep(3)
+    tap(1000, 190)
+    time.sleep(3)
+    if 'GlobalSearch' not in focus():
+        return False
+    adb('shell', 'am', 'broadcast', '-a', 'ADB_CLEAR_TEXT')
+    time.sleep(0.8)
+    b64 = base64.b64encode(keyword.encode()).decode()
+    adb('shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', b64)
+    time.sleep(1.5)
+    tap(988, 186)
+    time.sleep(5)
+    return 'GlobalSearch' in focus()
+
+
 def count_details():
     n = set()
     if not os.path.exists(HARVEST_JSONL):
@@ -54,6 +73,7 @@ def count_details():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--count', type=int, default=350, help='目标详情条数')
+    ap.add_argument('--keyword', default='伦敦 二手', help='掉回首页时重搜用')
     ap.add_argument('--scroll-every', type=int, default=6, help='每点几张卡滚一小段')
     ap.add_argument('--settle', type=float, default=2.2, help='进详情页后等待秒数')
     args = ap.parse_args()
@@ -66,7 +86,7 @@ def main():
     col = 0
     fail_streak = 0
     i = 0
-    while count_details() - n0 < args.count and fail_streak < 10:
+    while count_details() - n0 < args.count and fail_streak < 20:
         i += 1
         x = 270 if col == 0 else 810
         tap(x, 1200)
@@ -74,7 +94,9 @@ def main():
         t0 = time.time()
         ok = False
         while time.time() - t0 < 5:
-            if 'NoteDetailActivity' in focus():
+            f = focus()
+            # 图文是 NoteDetailActivity，视频是别的 activity —— 离开搜索页即算进入
+            if PKG in f and 'GlobalSearch' not in f:
                 ok = True
                 break
             time.sleep(0.5)
@@ -89,12 +111,14 @@ def main():
         adb('shell', 'input', 'keyevent', '4')   # 返回列表
         time.sleep(1.2)
         if 'GlobalSearch' not in focus():
-            log('返回后不在搜索页（' + focus() + '），尝试再按一次返回')
+            log('返回后不在搜索页（' + focus() + '），再按一次返回')
             adb('shell', 'input', 'keyevent', '4')
             time.sleep(1.5)
             if 'GlobalSearch' not in focus():
-                log('无法回到搜索页，中止')
-                break
+                log('仍不在搜索页，重搜恢复')
+                if not research(args.keyword):
+                    log('重搜失败，中止')
+                    break
         if i % args.scroll_every == 0:
             adb('shell', 'input', 'swipe', '540', '1500', '540', '900', '400')
             time.sleep(1.5)
