@@ -59,6 +59,12 @@ TARGETS = {
         'gadget': True,                    # gadget script-interaction 形态
         'tcp_port': int(os.environ.get('XHS_RE_PORT', '27045')),  # adb reverse 反向通道端口
     },
+    'huawei': {
+        'serial': 'XPUDU17320004283',      # 华为 CAZ-AL10，Android 7.0（全新设备指纹）
+        'pkg': 'com.xingin.xhsre',
+        'gadget': True,
+        'tcp_port': int(os.environ.get('XHS_RE_PORT', '27045')),
+    },
 }
 TARGET = os.environ.get('XHS_TARGET', 'emu')
 
